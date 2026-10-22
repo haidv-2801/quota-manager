@@ -1,15 +1,20 @@
-use crate::adapters::{self, ChatRequest, Provider, ProviderError, Usage};
+use crate::adapters::{self, ChatOutcome, ChatRequest, Provider, ProviderError, Usage};
 use crate::message::{ContentBlock, Message, Role};
 use crate::quota::QuotaService;
+use crate::router::{self, Target};
+use secrecy::SecretString;
 use crate::store::Db;
 use crate::vault::Vault;
 use crate::{Error, Result};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 use serde::Serialize;
 use std::sync::Arc;
+use std::time::Duration;
 
 const MAX_TOKENS: u32 = 4096;
 const DEFAULT_TITLE: &str = "Hội thoại mới";
+/// Waits before the 1st and 2nd retry of a transient error on the same account.
+const RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Conversation {
@@ -31,12 +36,40 @@ pub struct StoredMessage {
     pub created_at: i64,
 }
 
+/// A switch the router made, shown in the chat as "đã chuyển từ X sang Y".
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SwitchRecord {
+    pub at: i64,
+    pub from_label: Option<String>,
+    pub to_label: String,
+    pub reason: String,
+}
+
+/// What `send` reports while it works.
+pub enum ChatEvent<'a> {
+    /// More reply text.
+    Chunk(&'a str),
+    /// The request moved to another account.
+    Switched { from: String, to: String, reason: &'static str },
+    /// Text already streamed is void; the reply starts over (after a switch or a retry).
+    Restart,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ChatError {
     #[error(transparent)]
     App(#[from] Error),
     #[error("{0}")]
     Provider(#[from] ProviderError),
+    #[error("no usable account{}", recovery_hint(.retry_in_secs))]
+    NoAccountAvailable { retry_in_secs: Option<u64> },
+}
+
+fn recovery_hint(secs: &Option<u64>) -> String {
+    match secs {
+        Some(s) => format!(" (an account recovers in about {s} s)"),
+        None => "; add one or reset a disabled account".into(),
+    }
 }
 
 impl From<rusqlite::Error> for ChatError {
@@ -52,22 +85,22 @@ pub struct ChatService<V: Vault> {
     vault: Arc<V>,
     factory: Factory,
     quota: QuotaService,
-}
-
-struct Target {
-    id: String,
-    provider: String,
-    model: String,
+    retry_delays: Vec<Duration>,
 }
 
 impl<V: Vault> ChatService<V> {
     pub fn new(db: Db, vault: Arc<V>) -> Self {
-        Self::with_factory(db, vault, Box::new(adapters::for_provider))
+        Self::build(db, vault, Box::new(adapters::for_provider), RETRY_DELAYS.to_vec())
     }
 
+    /// Custom provider factory with no waiting between retries; used by tests.
     pub fn with_factory(db: Db, vault: Arc<V>, factory: Factory) -> Self {
+        Self::build(db, vault, factory, vec![Duration::ZERO; RETRY_DELAYS.len()])
+    }
+
+    fn build(db: Db, vault: Arc<V>, factory: Factory, retry_delays: Vec<Duration>) -> Self {
         let quota = QuotaService::new(db.clone());
-        Self { db, vault, factory, quota }
+        Self { db, vault, factory, quota, retry_delays }
     }
 
     pub fn quota(&self) -> &QuotaService {
@@ -130,45 +163,158 @@ impl<V: Vault> ChatService<V> {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// Stores the user message, streams the reply, stores it. The user message is
-    /// kept even if the provider fails, so a retry never loses what was typed.
+    /// Stores the user message, then gets a reply from the best available account.
+    ///
+    /// - Transient errors are retried on the same account (delays 1 s, 3 s).
+    /// - Rate limit, exhausted credit, or a context the account cannot hold: the request moves
+    ///   to the next account, unless the conversation is pinned (then the error is returned).
+    /// - A rejected key disables the account and is reported, not worked around.
+    /// The user message stays stored whatever happens, so a retry never loses what was typed.
+    /// When a reply is cut off by a failure, its partial text is discarded and the next account
+    /// answers from scratch (`ChatEvent::Restart`); continuing from the partial is not done yet.
     pub async fn send(
         &self,
         conversation_id: &str,
         text: &str,
-        on_chunk: &mut (dyn FnMut(&str) + Send),
+        on_event: &mut (dyn FnMut(ChatEvent<'_>) + Send),
     ) -> std::result::Result<StoredMessage, ChatError> {
         if text.trim().is_empty() {
             return Err(Error::Invalid("message is empty".into()).into());
         }
         self.quota.sweep(now_ms())?;
-        let target = self.pick_target(conversation_id)?;
-        let provider = (self.factory)(&target.provider)
-            .ok_or_else(|| Error::Invalid(format!("provider '{}' is not supported yet", target.provider)))?;
-        let key = self
-            .vault
-            .get(&target.id)?
-            .ok_or_else(|| Error::Invalid("no API key stored for this account".into()))?;
-
+        let mut tried: Vec<String> = Vec::new();
+        let mut current = self.pick(conversation_id, &tried)?.ok_or_else(|| self.no_account())?;
         self.append(conversation_id, Role::User, text, None, None)?;
-        let history = self
-            .get_messages(conversation_id)?
-            .into_iter()
-            .filter_map(|m| Some(Message::text(Role::parse(&m.role)?, m.text)))
-            .collect();
-        let req = ChatRequest { model: target.model.clone(), messages: history, max_tokens: MAX_TOKENS };
 
-        let out = match provider.stream_chat(&key, &req, on_chunk).await {
-            Ok(out) => out,
-            Err(e) => {
-                self.note_failure(&target.id, &e)?;
-                return Err(e.into());
+        loop {
+            let provider = (self.factory)(&current.provider)
+                .ok_or_else(|| Error::Invalid(format!("provider '{}' is not supported yet", current.provider)))?;
+            let key = self
+                .vault
+                .get(&current.id)?
+                .ok_or_else(|| Error::Invalid(format!("no API key stored for '{}'", current.label)))?;
+            let history = self
+                .get_messages(conversation_id)?
+                .into_iter()
+                .filter_map(|m| Some(Message::text(Role::parse(&m.role)?, m.text)))
+                .collect();
+            let req = ChatRequest { model: current.model.clone(), messages: history, max_tokens: MAX_TOKENS };
+
+            let err = match self.attempt(provider.as_ref(), &key, &req, on_event).await {
+                Ok(out) => return self.finish(conversation_id, &current, out),
+                Err(e) => e,
+            };
+            self.note_failure(&current.id, &err)?;
+            let movable = matches!(
+                err,
+                ProviderError::RateLimited { .. } | ProviderError::CreditExhausted | ProviderError::ContextTooLong
+            );
+            if !movable || current.pinned {
+                return Err(err.into());
             }
-        };
+            tried.push(current.id.clone());
+            let Some(next) = self.pick(conversation_id, &tried)? else {
+                return Err(match err {
+                    ProviderError::ContextTooLong => err.into(),
+                    _ => self.no_account(),
+                });
+            };
+            let reason = match err {
+                ProviderError::RateLimited { .. } => "rate_limited",
+                ProviderError::CreditExhausted => "credit_exhausted",
+                _ => "context_too_long",
+            };
+            self.record_switch(conversation_id, &current.id, &next.id, reason)?;
+            on_event(ChatEvent::Switched { from: current.label.clone(), to: next.label.clone(), reason });
+            current = next;
+        }
+    }
+
+    /// One account, with retries for transient errors.
+    async fn attempt(
+        &self,
+        provider: &dyn Provider,
+        key: &SecretString,
+        req: &ChatRequest,
+        on_event: &mut (dyn FnMut(ChatEvent<'_>) + Send),
+    ) -> std::result::Result<ChatOutcome, ProviderError> {
+        let mut delays = self.retry_delays.iter();
+        let mut emitted = 0usize;
+        loop {
+            let result = {
+                let mut forward = |s: &str| {
+                    emitted += 1;
+                    on_event(ChatEvent::Chunk(s));
+                };
+                provider.stream_chat(key, req, &mut forward).await
+            };
+            match (result, delays.next()) {
+                (Err(ProviderError::Transient(_)), Some(wait)) => {
+                    if emitted > 0 {
+                        on_event(ChatEvent::Restart);
+                        emitted = 0;
+                    }
+                    tokio::time::sleep(*wait).await;
+                }
+                (other, _) => {
+                    if other.is_err() && emitted > 0 {
+                        // the caller may switch account; whatever was streamed no longer counts
+                        on_event(ChatEvent::Restart);
+                    }
+                    return other;
+                }
+            }
+        }
+    }
+
+    fn finish(
+        &self,
+        conversation_id: &str,
+        target: &Target,
+        out: ChatOutcome,
+    ) -> std::result::Result<StoredMessage, ChatError> {
         self.quota.record_snapshot(&target.id, &out.rate_limit, now_ms())?;
         let msg = self.append(conversation_id, Role::Assistant, &out.text, Some(&target.id), Some(&target.model))?;
         self.record_usage(&target.id, &msg.id, out.usage)?;
         Ok(msg)
+    }
+
+    fn pick(&self, conversation_id: &str, tried: &[String]) -> Result<Option<Target>> {
+        router::pick(&self.db, conversation_id, tried)
+    }
+
+    fn no_account(&self) -> ChatError {
+        let retry_in_secs = router::soonest_recovery_secs(&self.db, now_ms()).unwrap_or(None);
+        ChatError::NoAccountAvailable { retry_in_secs }
+    }
+
+    fn record_switch(&self, conversation_id: &str, from: &str, to: &str, reason: &str) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT INTO switch_events (conversation_id, from_account_id, to_account_id, reason, at)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![conversation_id, from, to, reason, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_switches(&self, conversation_id: &str) -> Result<Vec<SwitchRecord>> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare(
+            "SELECT s.at, f.label, t.label, s.reason
+             FROM switch_events s
+             LEFT JOIN accounts f ON f.id = s.from_account_id
+             LEFT JOIN accounts t ON t.id = s.to_account_id
+             WHERE s.conversation_id = ?1 ORDER BY s.at, s.id",
+        )?;
+        let rows = stmt.query_map([conversation_id], |r| {
+            Ok(SwitchRecord {
+                at: r.get(0)?,
+                from_label: r.get(1)?,
+                to_label: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                reason: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Turns a provider failure into an account status so the next request skips it.
@@ -181,31 +327,6 @@ impl<V: Vault> ChatService<V> {
             ProviderError::InvalidKey => self.quota.mark_disabled(account_id),
             _ => Ok(()),
         }
-    }
-
-    /// Phase 2 selection: the pinned account, else the highest-priority usable one.
-    /// The quota-aware router replaces this in phase 4.
-    fn pick_target(&self, conversation_id: &str) -> Result<Target> {
-        let db = self.db.lock().unwrap();
-        let pinned: Option<Option<String>> = db
-            .query_row("SELECT pinned_account_id FROM conversations WHERE id = ?1", [conversation_id], |r| r.get(0))
-            .optional()?;
-        let pinned = pinned.ok_or(Error::NotFound)?;
-        let row = |r: &rusqlite::Row| Ok(Target { id: r.get(0)?, provider: r.get(1)?, model: r.get(2)? });
-        let target = match pinned {
-            Some(id) => db
-                .query_row("SELECT id, provider, default_model FROM accounts WHERE id = ?1", [id], row)
-                .optional()?,
-            None => db
-                .query_row(
-                    "SELECT id, provider, default_model FROM accounts
-                     WHERE status IN ('healthy', 'low') ORDER BY priority LIMIT 1",
-                    [],
-                    row,
-                )
-                .optional()?,
-        };
-        target.ok_or_else(|| Error::Invalid("no usable account; add one in the Accounts screen".into()))
     }
 
     fn append(
@@ -267,28 +388,66 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::{ChatOutcome, OnChunk, RateLimitInfo};
+    use crate::adapters::{OnChunk, RateLimitInfo};
     use crate::vault::MemoryVault;
     use crate::{store, AccountInput, AccountService};
     use async_trait::async_trait;
-    use secrecy::SecretString;
+    use secrecy::ExposeSecret;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
-    struct Fake {
-        reply: std::result::Result<&'static str, ProviderError>,
-        seen: Arc<Mutex<Vec<Vec<Message>>>>,
+    type Reply = std::result::Result<&'static str, ProviderError>;
+
+    /// One scripted answer: optional text streamed first, then the result.
+    #[derive(Clone)]
+    struct Step {
+        partial: Option<&'static str>,
+        result: Reply,
     }
+
+    fn ok(t: &'static str) -> Step {
+        Step { partial: None, result: Ok(t) }
+    }
+    fn fail(e: ProviderError) -> Step {
+        Step { partial: None, result: Err(e) }
+    }
+    fn fail_after(p: &'static str, e: ProviderError) -> Step {
+        Step { partial: Some(p), result: Err(e) }
+    }
+    fn rate_limited() -> ProviderError {
+        ProviderError::RateLimited { retry_after_secs: Some(30) }
+    }
+
+    /// Answers per API key; each call consumes one step, the last step repeats.
+    #[derive(Default)]
+    struct Script {
+        steps: Mutex<HashMap<String, Vec<Step>>>,
+        calls: Mutex<Vec<String>>,
+        seen: Mutex<Vec<(String, Vec<Message>)>>,
+    }
+
+    struct Fake(Arc<Script>);
 
     #[async_trait]
     impl Provider for Fake {
         async fn stream_chat(
             &self,
-            _key: &SecretString,
+            key: &SecretString,
             req: &ChatRequest,
             on_chunk: OnChunk<'_>,
         ) -> std::result::Result<ChatOutcome, ProviderError> {
-            self.seen.lock().unwrap().push(req.messages.clone());
-            let text = self.reply.clone()?;
+            let key = key.expose_secret().to_string();
+            self.0.calls.lock().unwrap().push(key.clone());
+            self.0.seen.lock().unwrap().push((key.clone(), req.messages.clone()));
+            let step = {
+                let mut all = self.0.steps.lock().unwrap();
+                let list = all.get_mut(&key).expect("no script for key");
+                if list.len() > 1 { list.remove(0) } else { list[0].clone() }
+            };
+            if let Some(p) = step.partial {
+                on_chunk(p);
+            }
+            let text = step.result?;
             on_chunk(text);
             Ok(ChatOutcome {
                 text: text.into(),
@@ -298,138 +457,274 @@ mod tests {
         }
     }
 
-    fn setup(
-        reply: std::result::Result<&'static str, ProviderError>,
-    ) -> (ChatService<MemoryVault>, AccountService<MemoryVault>, Arc<Mutex<Vec<Vec<Message>>>>) {
+    struct Env {
+        chat: ChatService<MemoryVault>,
+        accounts: AccountService<MemoryVault>,
+        script: Arc<Script>,
+    }
+
+    fn env(scripts: &[(&str, Vec<Step>)]) -> Env {
         let accounts = AccountService::new(store::open_in_memory().unwrap(), MemoryVault::default());
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let s2 = seen.clone();
+        let script = Arc::new(Script::default());
+        for (key, steps) in scripts {
+            script.steps.lock().unwrap().insert(key.to_string(), steps.clone());
+        }
+        let s2 = script.clone();
         let chat = ChatService::with_factory(
             accounts.db(),
             accounts.vault(),
-            Box::new(move |_| Some(Box::new(Fake { reply: reply.clone(), seen: s2.clone() }))),
+            Box::new(move |_| Some(Box::new(Fake(s2.clone())))),
         );
-        (chat, accounts, seen)
+        Env { chat, accounts, script }
     }
 
-    fn add_account(a: &AccountService<MemoryVault>, label: &str, priority: i64) -> String {
-        a.upsert(AccountInput {
-            id: None,
-            provider: "anthropic".into(),
-            label: label.into(),
-            default_model: "m".into(),
-            priority,
-            monthly_budget_usd: None,
-            api_key: Some("sk-1234".into()),
-        })
-        .unwrap()
-        .id
+    /// The account's API key doubles as its script selector.
+    fn add(env: &Env, label: &str, priority: i64) -> String {
+        env.accounts
+            .upsert(AccountInput {
+                id: None,
+                provider: "anthropic".into(),
+                label: label.into(),
+                default_model: "m".into(),
+                priority,
+                monthly_budget_usd: None,
+                api_key: Some(format!("key-{label}")),
+            })
+            .unwrap()
+            .id
+    }
+
+    fn status_of(env: &Env, label: &str) -> String {
+        env.accounts.list().unwrap().into_iter().find(|a| a.label == label).unwrap().status
+    }
+
+    fn calls(env: &Env) -> Vec<String> {
+        env.script.calls.lock().unwrap().clone()
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Ev {
+        Chunk(String),
+        Switched(String, String, &'static str),
+        Restart,
+    }
+
+    async fn send(env: &Env, conv: &str, text: &str) -> (std::result::Result<StoredMessage, ChatError>, Vec<Ev>) {
+        let mut events = Vec::new();
+        let r = env
+            .chat
+            .send(conv, text, &mut |e| {
+                events.push(match e {
+                    ChatEvent::Chunk(c) => Ev::Chunk(c.into()),
+                    ChatEvent::Switched { from, to, reason } => Ev::Switched(from, to, reason),
+                    ChatEvent::Restart => Ev::Restart,
+                })
+            })
+            .await;
+        (r, events)
     }
 
     #[tokio::test]
     async fn stores_both_messages_usage_and_sends_full_history() {
-        let (chat, accounts, seen) = setup(Ok("pong"));
-        let acc = add_account(&accounts, "A", 1);
-        let conv = chat.create_conversation().unwrap();
-        let mut chunks = Vec::new();
-        chat.send(&conv.id, "ping", &mut |c| chunks.push(c.to_string())).await.unwrap();
-        chat.send(&conv.id, "again", &mut |_| {}).await.unwrap();
-        assert_eq!(chunks, ["pong"]);
-        let msgs = chat.get_messages(&conv.id).unwrap();
+        let e = env(&[("key-A", vec![ok("pong")])]);
+        let acc = add(&e, "A", 1);
+        let conv = e.chat.create_conversation().unwrap();
+        let (r, events) = send(&e, &conv.id, "ping").await;
+        r.unwrap();
+        send(&e, &conv.id, "again").await.0.unwrap();
+        assert_eq!(events, [Ev::Chunk("pong".into())]);
+        let msgs = e.chat.get_messages(&conv.id).unwrap();
         let roles: Vec<_> = msgs.iter().map(|m| (m.role.as_str(), m.text.as_str())).collect();
         assert_eq!(roles, [("user", "ping"), ("assistant", "pong"), ("user", "again"), ("assistant", "pong")]);
         assert_eq!(msgs[1].account_id.as_deref(), Some(acc.as_str()));
-        // second request carried the whole conversation so far
-        assert_eq!(seen.lock().unwrap()[1].len(), 3);
-        let n: i64 = chat
+        // the second request carried the whole conversation so far
+        assert_eq!(e.script.seen.lock().unwrap()[1].1.len(), 3);
+        let n: i64 = e
+            .chat
             .db
             .lock()
             .unwrap()
             .query_row("SELECT COUNT(*) FROM usage_events WHERE input_tokens = 3", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2);
-        assert_eq!(chat.list_conversations().unwrap()[0].title, "ping");
+        assert_eq!(e.chat.list_conversations().unwrap()[0].title, "ping");
     }
 
     #[tokio::test]
-    async fn provider_failure_keeps_the_user_message() {
-        let (chat, accounts, _) = setup(Err(ProviderError::RateLimited { retry_after_secs: Some(5) }));
-        add_account(&accounts, "A", 1);
-        let conv = chat.create_conversation().unwrap();
-        let err = chat.send(&conv.id, "hello", &mut |_| {}).await.unwrap_err();
-        assert!(matches!(err, ChatError::Provider(ProviderError::RateLimited { .. })));
-        let msgs = chat.get_messages(&conv.id).unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].text, "hello");
+    async fn rate_limit_moves_the_request_to_the_next_account() {
+        let e = env(&[("key-A", vec![fail(rate_limited())]), ("key-B", vec![ok("from b")])]);
+        add(&e, "A", 1);
+        let b = add(&e, "B", 2);
+        let conv = e.chat.create_conversation().unwrap();
+        let (r, events) = send(&e, &conv.id, "hello").await;
+        let reply = r.unwrap();
+        assert_eq!((reply.text.as_str(), reply.account_id.as_deref()), ("from b", Some(b.as_str())));
+        assert_eq!(events, [Ev::Switched("A".into(), "B".into(), "rate_limited"), Ev::Chunk("from b".into())]);
+        assert_eq!(status_of(&e, "A"), "cooling_down");
+        // B received the same history, with the user message once
+        let seen = e.script.seen.lock().unwrap();
+        assert_eq!(seen[1].0, "key-B");
+        assert_eq!(seen[1].1, [Message::text(Role::User, "hello")]);
+        drop(seen);
+        // one user message and one reply are stored, and the switch is on record
+        assert_eq!(e.chat.get_messages(&conv.id).unwrap().len(), 2);
+        let sw = e.chat.list_switches(&conv.id).unwrap();
+        assert_eq!(sw.len(), 1);
+        assert_eq!((sw[0].from_label.as_deref(), sw[0].to_label.as_str(), sw[0].reason.as_str()), (Some("A"), "B", "rate_limited"));
+        // the next request goes straight to B: A is cooling down
+        send(&e, &conv.id, "next").await.0.unwrap();
+        assert_eq!(calls(&e), ["key-A", "key-B", "key-B"]);
     }
 
     #[tokio::test]
-    async fn failures_set_account_status_and_skip_it_next_time() {
-        for (err, expected) in [
-            (ProviderError::RateLimited { retry_after_secs: Some(30) }, "cooling_down"),
-            (ProviderError::CreditExhausted, "exhausted"),
-            (ProviderError::InvalidKey, "disabled"),
-        ] {
-            let (chat, accounts, _) = setup(Err(err));
-            add_account(&accounts, "A", 1);
-            let conv = chat.create_conversation().unwrap();
-            assert!(chat.send(&conv.id, "hi", &mut |_| {}).await.is_err());
-            assert_eq!(accounts.list().unwrap()[0].status, expected);
-            // the only account is now out of rotation
-            let again = chat.send(&conv.id, "hi again", &mut |_| {}).await.unwrap_err();
-            assert!(again.to_string().contains("no usable account"), "{again}");
-        }
+    async fn exhausted_credit_switches_and_marks_the_account() {
+        let e = env(&[("key-A", vec![fail(ProviderError::CreditExhausted)]), ("key-B", vec![ok("b")])]);
+        add(&e, "A", 1);
+        add(&e, "B", 2);
+        let conv = e.chat.create_conversation().unwrap();
+        let (r, events) = send(&e, &conv.id, "hi").await;
+        r.unwrap();
+        assert_eq!(events[0], Ev::Switched("A".into(), "B".into(), "credit_exhausted"));
+        assert_eq!(status_of(&e, "A"), "exhausted");
     }
 
     #[tokio::test]
-    async fn transient_errors_leave_status_alone() {
-        let (chat, accounts, _) = setup(Err(ProviderError::Transient("net".into())));
-        add_account(&accounts, "A", 1);
-        let conv = chat.create_conversation().unwrap();
-        assert!(chat.send(&conv.id, "hi", &mut |_| {}).await.is_err());
-        assert_eq!(accounts.list().unwrap()[0].status, "healthy");
+    async fn a_pinned_conversation_is_never_moved() {
+        let e = env(&[("key-A", vec![fail(rate_limited())]), ("key-B", vec![ok("b")])]);
+        let a = add(&e, "A", 2);
+        add(&e, "B", 1);
+        let conv = e.chat.create_conversation().unwrap();
+        e.chat.pin_account(&conv.id, Some(&a)).unwrap();
+        let (r, _) = send(&e, &conv.id, "hi").await;
+        assert!(matches!(r.unwrap_err(), ChatError::Provider(ProviderError::RateLimited { .. })));
+        assert_eq!(calls(&e), ["key-A"]);
+        // the user message is kept for a retry
+        assert_eq!(e.chat.get_messages(&conv.id).unwrap().len(), 1);
+        // and with A cooling down, the next attempt reports it instead of using B
+        let (r, _) = send(&e, &conv.id, "again").await;
+        assert!(r.unwrap_err().to_string().contains("pinned"));
+        assert_eq!(calls(&e), ["key-A"]);
     }
 
     #[tokio::test]
-    async fn successful_reply_records_snapshot_and_flags_low() {
-        let (chat, accounts, _) = setup(Ok("ok"));
-        add_account(&accounts, "A", 1);
-        let conv = chat.create_conversation().unwrap();
-        chat.send(&conv.id, "hi", &mut |_| {}).await.unwrap();
-        // Fake reports no limits, so the account stays healthy and gets no snapshot row
-        let row = &chat.quota().dashboard(now_ms()).unwrap()[0];
-        assert_eq!(row.status, "healthy");
-        assert_eq!(row.snapshot_at, None);
-        assert_eq!(row.tokens_used_today, 7);
+    async fn when_every_account_fails_the_user_hears_there_is_none_left() {
+        let e = env(&[("key-A", vec![fail(rate_limited())]), ("key-B", vec![fail(ProviderError::CreditExhausted)])]);
+        add(&e, "A", 1);
+        add(&e, "B", 2);
+        let conv = e.chat.create_conversation().unwrap();
+        let (r, _) = send(&e, &conv.id, "hi").await;
+        let err = r.unwrap_err();
+        assert!(matches!(err, ChatError::NoAccountAvailable { retry_in_secs: Some(_) }), "{err:?}");
+        assert!(err.to_string().contains("no usable account"));
+        assert_eq!(e.chat.get_messages(&conv.id).unwrap().len(), 1);
+        // asking again before anything recovers fails fast without calling a provider
+        let before = calls(&e).len();
+        assert!(send(&e, &conv.id, "again").await.0.is_err());
+        assert_eq!(calls(&e).len(), before);
     }
 
     #[tokio::test]
-    async fn cooled_down_account_returns_after_sweep() {
-        let (chat, accounts, _) = setup(Ok("ok"));
-        let id = add_account(&accounts, "A", 1);
-        chat.quota().mark_rate_limited(&id, Some(0), now_ms() - 1).unwrap();
-        let conv = chat.create_conversation().unwrap();
+    async fn a_rejected_key_is_reported_not_worked_around() {
+        let e = env(&[("key-A", vec![fail(ProviderError::InvalidKey)]), ("key-B", vec![ok("b")])]);
+        add(&e, "A", 1);
+        add(&e, "B", 2);
+        let conv = e.chat.create_conversation().unwrap();
+        let (r, _) = send(&e, &conv.id, "hi").await;
+        assert!(matches!(r.unwrap_err(), ChatError::Provider(ProviderError::InvalidKey)));
+        assert_eq!(status_of(&e, "A"), "disabled");
+        assert_eq!(calls(&e), ["key-A"]);
+    }
+
+    #[tokio::test]
+    async fn transient_errors_retry_on_the_same_account() {
+        let e = env(&[("key-A", vec![fail(ProviderError::Transient("net".into())), ok("fine")])]);
+        add(&e, "A", 1);
+        let conv = e.chat.create_conversation().unwrap();
+        let (r, events) = send(&e, &conv.id, "hi").await;
+        assert_eq!(r.unwrap().text, "fine");
+        assert_eq!(calls(&e), ["key-A", "key-A"]);
+        assert_eq!(events, [Ev::Chunk("fine".into())]);
+        assert_eq!(status_of(&e, "A"), "healthy");
+    }
+
+    #[tokio::test]
+    async fn transient_errors_give_up_after_two_retries_without_switching() {
+        let e = env(&[("key-A", vec![fail(ProviderError::Transient("net".into()))]), ("key-B", vec![ok("b")])]);
+        add(&e, "A", 1);
+        add(&e, "B", 2);
+        let conv = e.chat.create_conversation().unwrap();
+        let (r, _) = send(&e, &conv.id, "hi").await;
+        assert!(matches!(r.unwrap_err(), ChatError::Provider(ProviderError::Transient(_))));
+        assert_eq!(calls(&e), ["key-A", "key-A", "key-A"]);
+        assert_eq!(status_of(&e, "A"), "healthy");
+    }
+
+    #[tokio::test]
+    async fn context_too_long_tries_a_roomier_account_without_penalising_the_first() {
+        let e = env(&[("key-A", vec![fail(ProviderError::ContextTooLong)]), ("key-B", vec![ok("b")])]);
+        add(&e, "A", 1);
+        add(&e, "B", 2);
+        let conv = e.chat.create_conversation().unwrap();
+        let (r, events) = send(&e, &conv.id, "hi").await;
+        r.unwrap();
+        assert_eq!(events[0], Ev::Switched("A".into(), "B".into(), "context_too_long"));
+        assert_eq!(status_of(&e, "A"), "healthy");
+        // if nobody can hold it, the user gets the context error itself
+        let e2 = env(&[("key-A", vec![fail(ProviderError::ContextTooLong)])]);
+        add(&e2, "A", 1);
+        let conv2 = e2.chat.create_conversation().unwrap();
+        let (r, _) = send(&e2, &conv2.id, "hi").await;
+        assert!(matches!(r.unwrap_err(), ChatError::Provider(ProviderError::ContextTooLong)));
+    }
+
+    #[tokio::test]
+    async fn text_streamed_before_a_failure_is_voided() {
+        let e = env(&[("key-A", vec![fail_after("par", rate_limited())]), ("key-B", vec![ok("whole")])]);
+        add(&e, "A", 1);
+        add(&e, "B", 2);
+        let conv = e.chat.create_conversation().unwrap();
+        let (r, events) = send(&e, &conv.id, "hi").await;
+        assert_eq!(r.unwrap().text, "whole");
+        assert_eq!(
+            events,
+            [
+                Ev::Chunk("par".into()),
+                Ev::Restart,
+                Ev::Switched("A".into(), "B".into(), "rate_limited"),
+                Ev::Chunk("whole".into()),
+            ]
+        );
+        // only the complete reply is stored
+        let msgs = e.chat.get_messages(&conv.id).unwrap();
+        assert_eq!(msgs.last().unwrap().text, "whole");
+    }
+
+    #[tokio::test]
+    async fn a_cooled_down_account_returns_after_its_time() {
+        let e = env(&[("key-A", vec![ok("ok")])]);
+        let id = add(&e, "A", 1);
+        e.chat.quota().mark_rate_limited(&id, Some(0), now_ms() - 1).unwrap();
+        let conv = e.chat.create_conversation().unwrap();
         // send() sweeps first, so an expired cool-down does not block the request
-        assert!(chat.send(&conv.id, "hi", &mut |_| {}).await.is_ok());
+        assert!(send(&e, &conv.id, "hi").await.0.is_ok());
     }
 
     #[tokio::test]
-    async fn uses_pinned_account_over_priority() {
-        let (chat, accounts, _) = setup(Ok("ok"));
-        add_account(&accounts, "first", 1);
-        let second = add_account(&accounts, "second", 2);
-        let conv = chat.create_conversation().unwrap();
-        chat.pin_account(&conv.id, Some(&second)).unwrap();
-        let m = chat.send(&conv.id, "x", &mut |_| {}).await.unwrap();
-        assert_eq!(m.account_id.as_deref(), Some(second.as_str()));
+    async fn errors_without_account_or_with_empty_text_store_nothing() {
+        let e = env(&[]);
+        let conv = e.chat.create_conversation().unwrap();
+        assert!(matches!(send(&e, &conv.id, "x").await.0, Err(ChatError::NoAccountAvailable { .. })));
+        assert!(send(&e, &conv.id, "   ").await.0.is_err());
+        assert!(e.chat.get_messages(&conv.id).unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn errors_without_account_or_with_empty_text() {
-        let (chat, _, _) = setup(Ok("ok"));
-        let conv = chat.create_conversation().unwrap();
-        assert!(chat.send(&conv.id, "x", &mut |_| {}).await.is_err());
-        assert!(chat.send(&conv.id, "   ", &mut |_| {}).await.is_err());
-        assert!(chat.get_messages(&conv.id).unwrap().is_empty());
+    async fn successful_reply_keeps_status_when_no_limits_are_reported() {
+        let e = env(&[("key-A", vec![ok("ok")])]);
+        add(&e, "A", 1);
+        let conv = e.chat.create_conversation().unwrap();
+        send(&e, &conv.id, "hi").await.0.unwrap();
+        let row = &e.chat.quota().dashboard(now_ms()).unwrap()[0];
+        assert_eq!((row.status.as_str(), row.snapshot_at, row.tokens_used_today), ("healthy", None, 7));
     }
 }

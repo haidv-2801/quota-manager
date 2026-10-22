@@ -1,14 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  createConversation, getMessages, listAccounts, listConversations, onChunk, pinAccount, sendMessage,
+  createConversation, getMessages, listAccounts, listConversations, listSwitches, onChunk, onRestart,
+  onSwitched, pinAccount, sendMessage,
 } from "../../ipc/api";
-import type { Account, Conversation, StoredMessage } from "../../ipc/types";
+import type { Account, Conversation, StoredMessage, SwitchRecord } from "../../ipc/types";
+import { buildRows, switchText } from "./switchNotice";
 
 export function ChatScreen() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<StoredMessage[]>([]);
+  const [switches, setSwitches] = useState<SwitchRecord[]>([]);
+  const [liveNotices, setLiveNotices] = useState<string[]>([]);
   const [draft, setDraft] = useState("");
   const [streaming, setStreaming] = useState("");
   const [busy, setBusy] = useState(false);
@@ -21,21 +25,35 @@ export function ChatScreen() {
   }, []);
 
   const loadMessages = useCallback(async (id: string) => {
-    setMessages(await getMessages(id));
+    const [m, sw] = await Promise.all([getMessages(id), listSwitches(id)]);
+    setMessages(m);
+    setSwitches(sw);
   }, []);
 
   useEffect(() => {
     void refreshConversations();
     void listAccounts().then(setAccounts);
-    const unlisten = onChunk((e) => {
-      if (e.conversation_id === activeRef.current) setStreaming((s) => s + e.delta);
-    });
-    return () => { void unlisten.then((f) => f()); };
+    const unlisten = [
+      onChunk((e) => {
+        if (e.conversation_id === activeRef.current) setStreaming((s) => s + e.delta);
+      }),
+      // the reply starts over after a switch or retry: drop what was streamed so far
+      onRestart((e) => {
+        if (e.conversation_id === activeRef.current) setStreaming("");
+      }),
+      onSwitched((e) => {
+        if (e.conversation_id === activeRef.current) {
+          setLiveNotices((n) => [...n, switchText(e.from, e.to, e.reason)]);
+        }
+      }),
+    ];
+    return () => { unlisten.forEach((u) => void u.then((f) => f())); };
   }, [refreshConversations]);
 
   async function open(id: string) {
     setActiveId(id);
     setStreaming("");
+    setLiveNotices([]);
     setError(null);
     await loadMessages(id);
   }
@@ -55,6 +73,7 @@ export function ChatScreen() {
     setBusy(true);
     setError(null);
     setStreaming("");
+    setLiveNotices([]);
     // show the user's message immediately; it is already persisted by the backend before the request goes out
     setMessages((m) => [...m, { id: "pending", conversation_id: id, seq: m.length + 1, role: "user", text, account_id: null, model: null, created_at: Date.now() }]);
     try {
@@ -64,7 +83,10 @@ export function ChatScreen() {
     } finally {
       setBusy(false);
       setStreaming("");
-      if (activeRef.current === id) await loadMessages(id);
+      if (activeRef.current === id) {
+        await loadMessages(id);
+        setLiveNotices([]); // now shown from the stored switch records
+      }
       await refreshConversations();
     }
   }
@@ -102,12 +124,17 @@ export function ChatScreen() {
               </label>
             </div>
             <div className="messages">
-              {messages.map((m) => (
-                <div key={m.id} className={`msg ${m.role}`}>
-                  <pre>{m.text}</pre>
-                  {m.model && <small>{m.model}</small>}
-                </div>
-              ))}
+              {buildRows(messages, switches).map((row) =>
+                row.kind === "switch" ? (
+                  <div key={row.key} className="notice">{row.text}</div>
+                ) : (
+                  <div key={row.message.id} className={`msg ${row.message.role}`}>
+                    <pre>{row.message.text}</pre>
+                    {row.message.model && <small>{row.message.model}</small>}
+                  </div>
+                ),
+              )}
+              {liveNotices.map((t, i) => <div key={`live-${i}`} className="notice">{t}</div>)}
               {streaming && <div className="msg assistant"><pre>{streaming}</pre></div>}
             </div>
             {error && <p className="error">{error}</p>}

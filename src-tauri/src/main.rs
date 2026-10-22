@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use quota_core::chat::{ChatService, Conversation, StoredMessage};
+use quota_core::chat::{ChatEvent, ChatService, Conversation, StoredMessage, SwitchRecord};
 use quota_core::quota::AccountQuota;
 use quota_core::{store, vault::KeyringVault, Account, AccountInput, AccountService};
 use serde::Serialize;
@@ -17,6 +17,19 @@ fn err(e: impl std::fmt::Display) -> String {
 struct Chunk {
     conversation_id: String,
     delta: String,
+}
+
+#[derive(Clone, Serialize)]
+struct Switched {
+    conversation_id: String,
+    from: String,
+    to: String,
+    reason: String,
+}
+
+#[derive(Clone, Serialize)]
+struct Restart {
+    conversation_id: String,
 }
 
 fn now_ms() -> i64 {
@@ -78,7 +91,13 @@ fn pin_account(chat: State<Chat>, conversation_id: String, account_id: Option<St
     chat.pin_account(&conversation_id, account_id.as_deref()).map_err(err)
 }
 
-/// Streams the reply as `chunk` events and returns the stored assistant message.
+#[tauri::command]
+fn list_switches(chat: State<Chat>, conversation_id: String) -> Result<Vec<SwitchRecord>, String> {
+    chat.list_switches(&conversation_id).map_err(err)
+}
+
+/// Streams the reply as `chunk` events (plus `switched` and `restart` when the router moves the
+/// request to another account) and returns the stored assistant message.
 #[tauri::command]
 async fn send_message(
     app: AppHandle,
@@ -87,11 +106,18 @@ async fn send_message(
     text: String,
 ) -> Result<StoredMessage, String> {
     let id = conversation_id.clone();
-    let chunk_app = app.clone();
-    let mut on_chunk = move |delta: &str| {
-        let _ = chunk_app.emit("chunk", Chunk { conversation_id: id.clone(), delta: delta.to_string() });
+    let event_app = app.clone();
+    let mut on_event = move |ev: ChatEvent| {
+        let conversation_id = id.clone();
+        let _ = match ev {
+            ChatEvent::Chunk(delta) => event_app.emit("chunk", Chunk { conversation_id, delta: delta.to_string() }),
+            ChatEvent::Switched { from, to, reason } => {
+                event_app.emit("switched", Switched { conversation_id, from, to, reason: reason.to_string() })
+            }
+            ChatEvent::Restart => event_app.emit("restart", Restart { conversation_id }),
+        };
     };
-    let result = chat.send(&conversation_id, &text, &mut on_chunk).await.map_err(err);
+    let result = chat.send(&conversation_id, &text, &mut on_event).await.map_err(err);
     // success or failure, quota numbers and statuses may have moved
     if let Ok(rows) = chat.quota().dashboard(now_ms()) {
         emit_quota(&app, rows);
@@ -133,6 +159,7 @@ fn main() {
             list_conversations,
             get_messages,
             pin_account,
+            list_switches,
             send_message,
             get_quota_dashboard,
             reset_account_status

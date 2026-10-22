@@ -60,3 +60,21 @@ export interface AccountQuota {
   tokens_used_today: number;
   tokens_used_month: number;
 }
+
+export interface SwitchRecord {
+  at: number;
+  from_label: string | null;
+  to_label: string;
+  reason: string;
+}
+
+export interface SwitchedEvent {
+  conversation_id: string;
+  from: string;
+  to: string;
+  reason: string;
+}
+
+export interface RestartEvent {
+  conversation_id: string;
+}
