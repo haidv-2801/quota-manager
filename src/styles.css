@@ -23,3 +23,11 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid #8884; }
 .msg pre { margin: 0; white-space: pre-wrap; font-family: inherit; }
 .msg small { opacity: 0.6; }
 .chat textarea { flex: 1; resize: none; }
+.alerts { background: #f59e0b33; border-bottom: 1px solid #f59e0b; padding: 8px 24px; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+.alerts p { margin: 0; }
+.card { border: 1px solid #8884; border-radius: 8px; padding: 12px 16px; margin-top: 12px; display: grid; gap: 8px; }
+.card.status-low { border-color: #f59e0b; }
+.card.status-cooling_down, .card.status-exhausted, .card.status-disabled { border-color: #c0392b; }
+.pill { padding: 2px 8px; border-radius: 999px; background: #8883; font-size: 12px; }
+.bar { display: grid; gap: 2px; }
+.bar progress { width: 100%; }

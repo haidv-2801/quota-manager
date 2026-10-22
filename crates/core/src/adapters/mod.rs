@@ -23,8 +23,10 @@ pub struct Usage {
 /// Rate-limit state reported by the provider, normalised. Reset times are unix ms.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RateLimitInfo {
+    pub requests_limit: Option<i64>,
     pub requests_remaining: Option<i64>,
     pub requests_reset_at: Option<i64>,
+    pub tokens_limit: Option<i64>,
     pub tokens_remaining: Option<i64>,
     pub tokens_reset_at: Option<i64>,
 }

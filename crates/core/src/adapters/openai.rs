@@ -77,8 +77,10 @@ pub(crate) fn parse_duration_ms(s: &str) -> Option<i64> {
 pub(crate) fn rate_limit_from(headers: &reqwest::header::HeaderMap, now: i64) -> RateLimitInfo {
     let reset = |name| header_str(headers, name).and_then(parse_duration_ms).map(|ms| now + ms);
     RateLimitInfo {
+        requests_limit: header_i64(headers, "x-ratelimit-limit-requests"),
         requests_remaining: header_i64(headers, "x-ratelimit-remaining-requests"),
         requests_reset_at: reset("x-ratelimit-reset-requests"),
+        tokens_limit: header_i64(headers, "x-ratelimit-limit-tokens"),
         tokens_remaining: header_i64(headers, "x-ratelimit-remaining-tokens"),
         tokens_reset_at: reset("x-ratelimit-reset-tokens"),
     }
@@ -197,6 +199,7 @@ data: [DONE]\n\n";
             .and(header("authorization", "Bearer sk-test"))
             .respond_with(
                 ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-limit-requests", "100")
                     .insert_header("x-ratelimit-remaining-requests", "99")
                     .insert_header("x-ratelimit-remaining-tokens", "5000")
                     .insert_header("x-ratelimit-reset-tokens", "1s")
@@ -213,6 +216,7 @@ data: [DONE]\n\n";
         assert_eq!(out.text, "Hello");
         assert_eq!(got, ["Hel", "lo"]);
         assert_eq!(out.usage, Usage { input_tokens: 7, output_tokens: 2 });
+        assert_eq!(out.rate_limit.requests_limit, Some(100));
         assert_eq!(out.rate_limit.requests_remaining, Some(99));
         assert!(out.rate_limit.tokens_reset_at.unwrap() >= before + 1000);
     }

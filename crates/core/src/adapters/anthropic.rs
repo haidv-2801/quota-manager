@@ -61,8 +61,10 @@ pub(crate) fn rate_limit_from(headers: &reqwest::header::HeaderMap) -> RateLimit
             .map(|d| d.timestamp_millis())
     };
     RateLimitInfo {
+        requests_limit: header_i64(headers, "anthropic-ratelimit-requests-limit"),
         requests_remaining: header_i64(headers, "anthropic-ratelimit-requests-remaining"),
         requests_reset_at: reset("anthropic-ratelimit-requests-reset"),
+        tokens_limit: header_i64(headers, "anthropic-ratelimit-tokens-limit"),
         tokens_remaining: header_i64(headers, "anthropic-ratelimit-tokens-remaining"),
         tokens_reset_at: reset("anthropic-ratelimit-tokens-reset"),
     }
@@ -192,6 +194,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
+                    .insert_header("anthropic-ratelimit-requests-limit", "50")
                     .insert_header("anthropic-ratelimit-requests-remaining", "49")
                     .insert_header("anthropic-ratelimit-tokens-remaining", "9000")
                     .insert_header("anthropic-ratelimit-tokens-reset", "2026-01-01T00:00:00Z")
@@ -207,6 +210,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(out.text, "Hello");
         assert_eq!(got, ["Hel", "lo"]);
         assert_eq!(out.usage, Usage { input_tokens: 12, output_tokens: 5 });
+        assert_eq!(out.rate_limit.requests_limit, Some(50));
         assert_eq!(out.rate_limit.requests_remaining, Some(49));
         assert_eq!(out.rate_limit.tokens_remaining, Some(9000));
         assert_eq!(out.rate_limit.tokens_reset_at, Some(1_767_225_600_000));
