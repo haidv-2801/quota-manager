@@ -3,7 +3,8 @@ use crate::{Error, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use crate::store::{self, Db};
+use std::sync::Arc;
 
 const PROVIDERS: &[&str] = &["anthropic", "openai", "gemini", "ollama"];
 
@@ -33,13 +34,21 @@ pub struct AccountInput {
 }
 
 pub struct AccountService<V: Vault> {
-    db: Mutex<Connection>,
-    vault: V,
+    db: Db,
+    vault: Arc<V>,
 }
 
 impl<V: Vault> AccountService<V> {
     pub fn new(db: Connection, vault: V) -> Self {
-        Self { db: Mutex::new(db), vault }
+        Self { db: store::shared(db), vault: Arc::new(vault) }
+    }
+
+    pub fn db(&self) -> Db {
+        self.db.clone()
+    }
+
+    pub fn vault(&self) -> Arc<V> {
+        self.vault.clone()
     }
 
     pub fn list(&self) -> Result<Vec<Account>> {

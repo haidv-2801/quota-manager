@@ -13,5 +13,6 @@ Khung Tauri 2 + React/TypeScript. Lõi Rust nằm trong `crates/core` (SQLite, k
 - `npm run build` (kiểm kiểu TypeScript + build UI)
 
 ## Phạm vi
-Có: thêm/sửa/xoá tài khoản, key lưu trong Credential Manager (UI chỉ thấy 4 ký tự cuối), migration SQLite theo schema trong tech spec.
-Chưa có: chat, adapter, quota, router (Giai đoạn 2 trở đi).
+Giai đoạn 1: thêm/sửa/xoá tài khoản, key lưu trong Credential Manager (UI chỉ thấy 4 ký tự cuối), migration SQLite theo schema trong tech spec.
+Giai đoạn 2: chat streaming qua adapter Anthropic + OpenAI, lưu hội thoại và usage vào SQLite, ghim tài khoản cho từng hội thoại.
+Chưa có: quota tracker, router tự chuyển, handoff (Giai đoạn 3 trở đi).

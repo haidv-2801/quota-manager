@@ -9,3 +9,17 @@ th, td { text-align: left; padding: 8px; border-bottom: 1px solid #8884; }
 .form .row { justify-content: flex-start; }
 .hint { font-size: 13px; opacity: 0.75; margin: 0; }
 .error { color: #c0392b; }
+.tabs { display: flex; gap: 4px; padding: 8px 24px 0; border-bottom: 1px solid #8884; }
+.tabs .on { font-weight: 600; }
+.chat { display: grid; grid-template-columns: 240px 1fr; height: calc(100vh - 44px); }
+.chat aside { border-right: 1px solid #8884; padding: 12px; overflow: auto; }
+.chat aside ul { list-style: none; padding: 0; margin: 12px 0 0; }
+.chat aside li { padding: 8px; border-radius: 6px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat aside li.active { background: #8883; }
+.chat section { display: flex; flex-direction: column; padding: 12px 16px; min-height: 0; }
+.messages { flex: 1; overflow: auto; display: flex; flex-direction: column; gap: 8px; padding: 12px 0; }
+.msg { max-width: 80%; padding: 8px 12px; border-radius: 8px; background: #8882; }
+.msg.user { align-self: flex-end; background: #3b82f633; }
+.msg pre { margin: 0; white-space: pre-wrap; font-family: inherit; }
+.msg small { opacity: 0.6; }
+.chat textarea { flex: 1; resize: none; }

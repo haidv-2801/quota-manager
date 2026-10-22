@@ -21,3 +21,26 @@ export interface AccountInput {
   monthly_budget_usd: number | null;
   api_key?: string;
 }
+
+export interface Conversation {
+  id: string;
+  title: string;
+  pinned_account_id: string | null;
+  updated_at: number;
+}
+
+export interface StoredMessage {
+  id: string;
+  conversation_id: string;
+  seq: number;
+  role: "user" | "assistant" | "system";
+  text: string;
+  account_id: string | null;
+  model: string | null;
+  created_at: number;
+}
+
+export interface ChunkEvent {
+  conversation_id: string;
+  delta: string;
+}
