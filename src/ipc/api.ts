@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { Account, AccountInput, AccountQuota, ChunkEvent, Conversation, StoredMessage } from "./types";
+import type {
+  Account, AccountInput, AccountQuota, ChunkEvent, Conversation, RestartEvent, StoredMessage, SwitchedEvent, SwitchRecord,
+} from "./types";
 
 export const listAccounts = () => invoke<Account[]>("list_accounts");
 export const upsertAccount = (input: AccountInput) => invoke<Account>("upsert_account", { input });
@@ -22,3 +24,10 @@ export const getQuotaDashboard = () => invoke<AccountQuota[]>("get_quota_dashboa
 export const resetAccountStatus = (accountId: string) => invoke<void>("reset_account_status", { accountId });
 export const onQuotaChanged = (handler: (rows: AccountQuota[]) => void): Promise<UnlistenFn> =>
   listen<AccountQuota[]>("quota_changed", (e) => handler(e.payload));
+
+export const listSwitches = (conversationId: string) =>
+  invoke<SwitchRecord[]>("list_switches", { conversationId });
+export const onSwitched = (handler: (e: SwitchedEvent) => void): Promise<UnlistenFn> =>
+  listen<SwitchedEvent>("switched", (e) => handler(e.payload));
+export const onRestart = (handler: (e: RestartEvent) => void): Promise<UnlistenFn> =>
+  listen<RestartEvent>("restart", (e) => handler(e.payload));

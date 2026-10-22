@@ -4,6 +4,7 @@ pub mod accounts;
 pub mod error;
 pub mod message;
 pub mod quota;
+pub mod router;
 pub mod store;
 pub mod vault;
 
