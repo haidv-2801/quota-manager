@@ -44,3 +44,19 @@ export interface ChunkEvent {
   conversation_id: string;
   delta: string;
 }
+
+export interface AccountQuota {
+  account_id: string;
+  label: string;
+  provider: string;
+  status: string;
+  cooldown_until: number | null;
+  snapshot_at: number | null;
+  requests_remaining: number | null;
+  requests_limit: number | null;
+  tokens_remaining: number | null;
+  tokens_limit: number | null;
+  resets_at: number | null;
+  tokens_used_today: number;
+  tokens_used_month: number;
+}

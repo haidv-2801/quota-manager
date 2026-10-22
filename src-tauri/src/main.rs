@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use quota_core::chat::{ChatService, Conversation, StoredMessage};
+use quota_core::quota::AccountQuota;
 use quota_core::{store, vault::KeyringVault, Account, AccountInput, AccountService};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -16,6 +17,30 @@ fn err(e: impl std::fmt::Display) -> String {
 struct Chunk {
     conversation_id: String,
     delta: String,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Tells the UI the quota picture changed; the UI diffs it to raise alerts.
+fn emit_quota(app: &AppHandle, rows: Vec<AccountQuota>) {
+    let _ = app.emit("quota_changed", rows);
+}
+
+#[tauri::command]
+fn get_quota_dashboard(chat: State<Chat>) -> Result<Vec<AccountQuota>, String> {
+    chat.quota().dashboard(now_ms()).map_err(err)
+}
+
+#[tauri::command]
+fn reset_account_status(app: AppHandle, chat: State<Chat>, account_id: String) -> Result<(), String> {
+    chat.quota().reset_status(&account_id).map_err(err)?;
+    emit_quota(&app, chat.quota().dashboard(now_ms()).map_err(err)?);
+    Ok(())
 }
 
 #[tauri::command]
@@ -62,10 +87,16 @@ async fn send_message(
     text: String,
 ) -> Result<StoredMessage, String> {
     let id = conversation_id.clone();
+    let chunk_app = app.clone();
     let mut on_chunk = move |delta: &str| {
-        let _ = app.emit("chunk", Chunk { conversation_id: id.clone(), delta: delta.to_string() });
+        let _ = chunk_app.emit("chunk", Chunk { conversation_id: id.clone(), delta: delta.to_string() });
     };
-    chat.send(&conversation_id, &text, &mut on_chunk).await.map_err(err)
+    let result = chat.send(&conversation_id, &text, &mut on_chunk).await.map_err(err);
+    // success or failure, quota numbers and statuses may have moved
+    if let Ok(rows) = chat.quota().dashboard(now_ms()) {
+        emit_quota(&app, rows);
+    }
+    result
 }
 
 fn main() {
@@ -75,7 +106,22 @@ fn main() {
             std::fs::create_dir_all(&dir)?;
             let db = store::open(&dir.join("app.db"))?;
             let accounts = AccountService::new(db, KeyringVault);
-            app.manage(ChatService::new(accounts.db(), accounts.vault()));
+            let chat = ChatService::new(accounts.db(), accounts.vault());
+
+            // every 30 s: end expired cool-downs and refresh the dashboard
+            let quota = chat.quota().clone();
+            let handle = app.handle().clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let now = now_ms();
+                if quota.sweep(now).is_ok() {
+                    if let Ok(rows) = quota.dashboard(now) {
+                        emit_quota(&handle, rows);
+                    }
+                }
+            });
+
+            app.manage(chat);
             app.manage(accounts);
             Ok(())
         })
@@ -87,7 +133,9 @@ fn main() {
             list_conversations,
             get_messages,
             pin_account,
-            send_message
+            send_message,
+            get_quota_dashboard,
+            reset_account_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running app");

@@ -10,7 +10,10 @@ pub fn shared(conn: Connection) -> Db {
     Arc::new(Mutex::new(conn))
 }
 
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_quota_limits.sql"),
+];
 
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;

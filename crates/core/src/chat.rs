@@ -1,5 +1,6 @@
 use crate::adapters::{self, ChatRequest, Provider, ProviderError, Usage};
 use crate::message::{ContentBlock, Message, Role};
+use crate::quota::QuotaService;
 use crate::store::Db;
 use crate::vault::Vault;
 use crate::{Error, Result};
@@ -50,6 +51,7 @@ pub struct ChatService<V: Vault> {
     db: Db,
     vault: Arc<V>,
     factory: Factory,
+    quota: QuotaService,
 }
 
 struct Target {
@@ -64,7 +66,12 @@ impl<V: Vault> ChatService<V> {
     }
 
     pub fn with_factory(db: Db, vault: Arc<V>, factory: Factory) -> Self {
-        Self { db, vault, factory }
+        let quota = QuotaService::new(db.clone());
+        Self { db, vault, factory, quota }
+    }
+
+    pub fn quota(&self) -> &QuotaService {
+        &self.quota
     }
 
     pub fn create_conversation(&self) -> Result<Conversation> {
@@ -134,6 +141,7 @@ impl<V: Vault> ChatService<V> {
         if text.trim().is_empty() {
             return Err(Error::Invalid("message is empty".into()).into());
         }
+        self.quota.sweep(now_ms())?;
         let target = self.pick_target(conversation_id)?;
         let provider = (self.factory)(&target.provider)
             .ok_or_else(|| Error::Invalid(format!("provider '{}' is not supported yet", target.provider)))?;
@@ -150,10 +158,29 @@ impl<V: Vault> ChatService<V> {
             .collect();
         let req = ChatRequest { model: target.model.clone(), messages: history, max_tokens: MAX_TOKENS };
 
-        let out = provider.stream_chat(&key, &req, on_chunk).await?;
+        let out = match provider.stream_chat(&key, &req, on_chunk).await {
+            Ok(out) => out,
+            Err(e) => {
+                self.note_failure(&target.id, &e)?;
+                return Err(e.into());
+            }
+        };
+        self.quota.record_snapshot(&target.id, &out.rate_limit, now_ms())?;
         let msg = self.append(conversation_id, Role::Assistant, &out.text, Some(&target.id), Some(&target.model))?;
         self.record_usage(&target.id, &msg.id, out.usage)?;
         Ok(msg)
+    }
+
+    /// Turns a provider failure into an account status so the next request skips it.
+    fn note_failure(&self, account_id: &str, e: &ProviderError) -> Result<()> {
+        match e {
+            ProviderError::RateLimited { retry_after_secs } => {
+                self.quota.mark_rate_limited(account_id, *retry_after_secs, now_ms())
+            }
+            ProviderError::CreditExhausted => self.quota.mark_exhausted(account_id),
+            ProviderError::InvalidKey => self.quota.mark_disabled(account_id),
+            _ => Ok(()),
+        }
     }
 
     /// Phase 2 selection: the pinned account, else the highest-priority usable one.
@@ -334,6 +361,56 @@ mod tests {
         let msgs = chat.get_messages(&conv.id).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].text, "hello");
+    }
+
+    #[tokio::test]
+    async fn failures_set_account_status_and_skip_it_next_time() {
+        for (err, expected) in [
+            (ProviderError::RateLimited { retry_after_secs: Some(30) }, "cooling_down"),
+            (ProviderError::CreditExhausted, "exhausted"),
+            (ProviderError::InvalidKey, "disabled"),
+        ] {
+            let (chat, accounts, _) = setup(Err(err));
+            add_account(&accounts, "A", 1);
+            let conv = chat.create_conversation().unwrap();
+            assert!(chat.send(&conv.id, "hi", &mut |_| {}).await.is_err());
+            assert_eq!(accounts.list().unwrap()[0].status, expected);
+            // the only account is now out of rotation
+            let again = chat.send(&conv.id, "hi again", &mut |_| {}).await.unwrap_err();
+            assert!(again.to_string().contains("no usable account"), "{again}");
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_errors_leave_status_alone() {
+        let (chat, accounts, _) = setup(Err(ProviderError::Transient("net".into())));
+        add_account(&accounts, "A", 1);
+        let conv = chat.create_conversation().unwrap();
+        assert!(chat.send(&conv.id, "hi", &mut |_| {}).await.is_err());
+        assert_eq!(accounts.list().unwrap()[0].status, "healthy");
+    }
+
+    #[tokio::test]
+    async fn successful_reply_records_snapshot_and_flags_low() {
+        let (chat, accounts, _) = setup(Ok("ok"));
+        add_account(&accounts, "A", 1);
+        let conv = chat.create_conversation().unwrap();
+        chat.send(&conv.id, "hi", &mut |_| {}).await.unwrap();
+        // Fake reports no limits, so the account stays healthy and gets no snapshot row
+        let row = &chat.quota().dashboard(now_ms()).unwrap()[0];
+        assert_eq!(row.status, "healthy");
+        assert_eq!(row.snapshot_at, None);
+        assert_eq!(row.tokens_used_today, 7);
+    }
+
+    #[tokio::test]
+    async fn cooled_down_account_returns_after_sweep() {
+        let (chat, accounts, _) = setup(Ok("ok"));
+        let id = add_account(&accounts, "A", 1);
+        chat.quota().mark_rate_limited(&id, Some(0), now_ms() - 1).unwrap();
+        let conv = chat.create_conversation().unwrap();
+        // send() sweeps first, so an expired cool-down does not block the request
+        assert!(chat.send(&conv.id, "hi", &mut |_| {}).await.is_ok());
     }
 
     #[tokio::test]
