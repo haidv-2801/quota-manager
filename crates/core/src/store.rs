@@ -1,6 +1,14 @@
 use crate::Result;
 use rusqlite::Connection;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+/// One SQLite connection shared by the services. Never hold the lock across an await.
+pub type Db = Arc<Mutex<Connection>>;
+
+pub fn shared(conn: Connection) -> Db {
+    Arc::new(Mutex::new(conn))
+}
 
 const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
 
