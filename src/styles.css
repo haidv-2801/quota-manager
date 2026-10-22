@@ -1,0 +1,11 @@
+:root { font-family: system-ui, sans-serif; color-scheme: light dark; }
+body { margin: 0; }
+main { max-width: 900px; margin: 0 auto; padding: 24px; }
+.row { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+th, td { text-align: left; padding: 8px; border-bottom: 1px solid #8884; }
+.form { display: grid; gap: 12px; padding: 16px; border: 1px solid #8884; border-radius: 8px; margin-top: 16px; }
+.form label { display: grid; gap: 4px; font-size: 14px; }
+.form .row { justify-content: flex-start; }
+.hint { font-size: 13px; opacity: 0.75; margin: 0; }
+.error { color: #c0392b; }
